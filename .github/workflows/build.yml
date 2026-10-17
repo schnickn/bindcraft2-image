@@ -1,0 +1,105 @@
+name: Build BindCraft2 image
+
+# Builds PacesaLab/BindCraft2 (checked out at a pinned commit) with this repo's Dockerfile, which
+# differs from upstream's only by the ACCEL build arg, and pushes linux/amd64 to ghcr.io.
+#
+# Run it from the Actions tab (Run workflow), or push a change to the Dockerfile or this file.
+# The image lands at ghcr.io/<owner>/bindcraft2:<accel> and ghcr.io/<owner>/bindcraft2:<accel>-<upstream sha>.
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: BindCraft2 commit, tag or branch to build
+        default: c0ee638d11bc010817c2c97ee58ed5c323e664e2
+      accel:
+        description: CUDA wheel set (cuda12 runs on driver >= 525; cuda13 needs driver >= 580)
+        type: choice
+        options: [cuda12, cuda13]
+        default: cuda12
+  push:
+    paths: [Dockerfile, .github/workflows/build.yml]
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  UPSTREAM_REF_DEFAULT: c0ee638d11bc010817c2c97ee58ed5c323e664e2
+  ACCEL_DEFAULT: cuda12
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Free disk space
+        # The runner has ~14 GB free; the CUDA wheels alone are 4 GB and Docker keeps every layer.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker image prune --all --force > /dev/null
+          df -h / | tail -1
+
+      - uses: actions/checkout@v4
+
+      - name: Resolve inputs
+        id: cfg
+        env:
+          IN_REF: ${{ inputs.upstream_ref }}
+          IN_ACCEL: ${{ inputs.accel }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          ref="${IN_REF:-$UPSTREAM_REF_DEFAULT}"
+          accel="${IN_ACCEL:-$ACCEL_DEFAULT}"
+          owner="$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')"
+          echo "ref=$ref"     >> "$GITHUB_OUTPUT"
+          echo "accel=$accel" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/$owner/bindcraft2" >> "$GITHUB_OUTPUT"
+
+      - name: Check out BindCraft2
+        uses: actions/checkout@v4
+        with:
+          repository: PacesaLab/BindCraft2
+          ref: ${{ steps.cfg.outputs.ref }}
+          path: upstream
+
+      - name: Record the upstream commit
+        id: up
+        run: |
+          sha="$(git -C upstream rev-parse HEAD)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "short=${sha:0:7}" >> "$GITHUB_OUTPUT"
+          rm -rf upstream/.git
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push (linux/amd64)
+        uses: docker/build-push-action@v6
+        with:
+          context: upstream
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          build-args: ACCEL=${{ steps.cfg.outputs.accel }}
+          tags: |
+            ${{ steps.cfg.outputs.image }}:${{ steps.cfg.outputs.accel }}
+            ${{ steps.cfg.outputs.image }}:${{ steps.cfg.outputs.accel }}-${{ steps.up.outputs.short }}
+          labels: |
+            org.opencontainers.image.title=BindCraft2 (${{ steps.cfg.outputs.accel }})
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description=BindCraft2 built from PacesaLab/BindCraft2 (${{ steps.up.outputs.short }}) with ${{ steps.cfg.outputs.accel }} wheels
+            org.opencontainers.image.revision=${{ steps.up.outputs.sha }}
+
+      - name: Smoke test (no GPU on the runner, so this only checks the install)
+        run: |
+          img='${{ steps.cfg.outputs.image }}:${{ steps.cfg.outputs.accel }}-${{ steps.up.outputs.short }}'
+          docker run --rm "$img" --help | head -5
+          docker run --rm --entrypoint python3 "$img" -c "import jax; print('jax', jax.__version__)"
+          docker run --rm --entrypoint python3 "$img" -m bindcraft.selfcheck '${{ steps.cfg.outputs.accel }}' --shipped-only && echo selfcheck ok
+          docker image inspect "$img" --format 'image size: {{.Size}} bytes'

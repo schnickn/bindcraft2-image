@@ -1,0 +1,833 @@
+#!/bin/bash
+# bc2 -- run BindCraft2 on Argon without editing job scripts or JSON by hand.
+#
+#   bc2 setup     one-time: download the container image and AlphaFold weights (runs as a batch job)
+#   bc2 new       answer a few questions; creates a campaign (settings.json + resources)
+#   bc2 run NAME  submit it to the queue (running it again resumes where it stopped)
+#   bc2 status    what is running, how many designs are accepted
+#   bc2 results   the best designs and how to copy them off Argon
+#
+# Run "bc2 help" for everything. Needs only bash and python3 (standard library), both on Argon.
+
+set -u
+BC2_VERSION="0.1"
+BC2_HOME="${BC2_HOME:-$HOME/bc2}"
+BC2_CONF="$BC2_HOME/config"
+BC2_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+IMAGE_DEFAULT="${BC2_IMAGE:-ghcr.io/schnickn/bindcraft2:cuda12}"
+CAMPAIGNS="$BC2_HOME/campaigns"
+NEEDED_MODELS="model_1_multimer_v3 model_2_multimer_v3 model_3_multimer_v3 model_4_multimer_v3 model_5_multimer_v3 model_1_ptm model_2_ptm"
+
+if [ -t 1 ]; then B=$'\e[1m'; D=$'\e[2m'; G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; C=$'\e[36m'; N=$'\e[0m'
+else B=; D=; G=; Y=; R=; C=; N=; fi
+say()  { printf '%s\n' "$*"; }
+ok()   { printf '%s✓%s %s\n' "$G" "$N" "$*"; }
+warn() { printf '%s!%s %s\n' "$Y" "$N" "$*" >&2; }
+die()  { printf '%serror:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
+head1() { printf '\n%s%s%s\n' "$B" "$*" "$N"; }
+
+if [ -f "$BC2_HOME" ]; then
+  die "$BC2_HOME is a file, probably this script, but bc2 keeps its data in a folder with that name. Move the script: mkdir -p ~/bin && mv $BC2_HOME ~/bin/bc2"
+fi
+command -v python3 >/dev/null 2>&1 || die "python3 not found. On Argon try:  module load python  (or use your own python3)"
+
+# ---------------------------------------------------------------- python helpers (stdlib only)
+read -r -d '' PYH <<'PYEOF'
+import sys, os, re, csv, json, math, collections
+import xml.etree.ElementTree as ET
+
+def struct(path):
+    """chains -> list of (resnum, icode) of CA atoms; or ('fasta', length)."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in ('.fasta', '.fa', '.faa'):
+        seq = ''.join(l.strip() for l in open(path) if not l.startswith('>'))
+        return {'fasta': len(seq)}
+    chains = collections.OrderedDict()
+    if ext in ('.pdb', '.ent'):
+        for l in open(path):
+            if l.startswith('ATOM') and l[12:16].strip() == 'CA' and l[16] in ' A':
+                try:
+                    key = (int(l[22:26]), l[26].strip())
+                except ValueError:
+                    continue
+                chains.setdefault(l[21], set()).add(key)
+        return chains
+    if ext in ('.cif', '.mmcif'):
+        import shlex
+        lines = open(path).read().splitlines()
+        i = 0
+        while i < len(lines):
+            if lines[i].strip() == 'loop_':
+                j, cols = i + 1, []
+                while j < len(lines) and lines[j].startswith('_atom_site.'):
+                    cols.append(lines[j].strip()[len('_atom_site.'):]); j += 1
+                if cols:
+                    def col(*names):
+                        for n in names:
+                            if n in cols: return cols.index(n)
+                        return None
+                    ia, ic, ir, ii = col('label_atom_id'), col('auth_asym_id', 'label_asym_id'), col('auth_seq_id', 'label_seq_id'), col('pdbx_PDB_ins_code')
+                    while j < len(lines) and not lines[j].startswith(('#', 'loop_', '_')):
+                        f = shlex.split(lines[j])
+                        j += 1
+                        if len(f) < len(cols) or f[ia] != 'CA':
+                            continue
+                        try:
+                            key = (int(f[ir]), '' if ii is None or f[ii] in '?.' else f[ii])
+                        except ValueError:
+                            continue
+                        chains.setdefault(f[ic], set()).add(key)
+                    return chains
+            i += 1
+        return chains
+    raise SystemExit('unsupported file type %r (use .pdb, .cif or .fasta)' % ext)
+
+def cmd_struct(path):
+    s = struct(path)
+    if 'fasta' in s:
+        print('fasta\t%d' % s['fasta']); return
+    for c, res in s.items():
+        nums = sorted(r[0] for r in res)
+        print('chain\t%s\t%d\t%d\t%d' % (c, len(res), nums[0], nums[-1]))
+
+def cmd_hotspots(path, chains, spots):
+    s = struct(path)
+    sel = [c for c in chains.split(',') if c] if chains else list(s.keys())
+    bad = []
+    for c in sel:
+        if c not in s: bad.append('chain %s is not in the file (it has: %s)' % (c, ', '.join(s.keys())))
+    if bad:
+        print('\n'.join(bad)); sys.exit(1)
+    for tok in [t.strip() for t in spots.split(',') if t.strip()]:
+        m = re.match(r'^([A-Za-z]*)(\d+)(?:-(\d+))?$', tok)
+        if not m:
+            bad.append("'%s' is not a residue like 54, A54, or A12-16" % tok); continue
+        ch = m.group(1) or sel[0]
+        lo = int(m.group(2)); hi = int(m.group(3) or lo)
+        if ch not in sel:
+            bad.append("'%s' uses chain %s, which is not one of the chains you picked (%s)" % (tok, ch, ','.join(sel))); continue
+        have = set(r[0] for r in s[ch])
+        missing = [n for n in range(lo, hi + 1) if n not in have]
+        if hi < lo: bad.append("'%s' goes backwards" % tok)
+        elif len(missing) == hi - lo + 1: bad.append("'%s': chain %s has no residues numbered %d-%d (it runs %d-%d)" % (tok, ch, lo, hi, min(have), max(have)))
+        elif missing: bad.append("'%s': chain %s is missing residue(s) %s" % (tok, ch, ','.join(map(str, missing[:6]))))
+    if bad:
+        print('\n'.join(bad)); sys.exit(1)
+
+def est(n):
+    return 2.0 * (3.4 + 38000 * n * n / 1e9)
+
+CARDS = [('L40S 48GB', 44.5), ('A40 48GB', 44.5), ('A100 80GB', 79.0), ('V100 32GB', 31.5)]
+
+def cmd_estimate(target, binder):
+    n = int(math.ceil((int(target) + int(binder)) / 32.0)) * 32
+    e = est(n)
+    print('n\t%d' % n); print('gib\t%.1f' % e)
+    for name, free in CARDS:
+        print('fit\t%s\t%d' % (name, max(0, int((free - 4.0) // e))))
+
+def cmd_mksettings(out):
+    g = os.environ.get
+    d = collections.OrderedDict()
+    d['campaign_name'] = g('BC_NAME')
+    if g('BC_KIND') == 'shipped':
+        d['target'] = g('BC_TARGET')
+    else:
+        t = collections.OrderedDict()
+        t['name'] = re.sub(r'[^A-Za-z0-9_]+', '_', os.path.splitext(os.path.basename(g('BC_TARGET')))[0])
+        t['target_path'] = os.path.basename(g('BC_TARGET'))
+        if g('BC_CHAINS'): t['chains'] = g('BC_CHAINS')
+        if g('BC_HOTSPOTS'): t['hotspots'] = g('BC_HOTSPOTS')
+        d['targets'] = [t]
+    mods = [m for m in g('BC_MODALITY', 'binder').split(',') if m]
+    d['modality'] = mods[0] if len(mods) == 1 else mods
+    for p in [p for p in g('BC_PROPS', '').split(',') if p]:
+        d[p] = True
+    if g('BC_LEN_MIN'):
+        d['binder_lengths'] = [int(g('BC_LEN_MIN')), int(g('BC_LEN_MAX') or g('BC_LEN_MIN'))]
+    d['number_of_final_designs'] = int(g('BC_NFINAL', '10'))
+    if g('BC_MAXTRAJ'): d['max_trajectories'] = int(g('BC_MAXTRAJ'))
+    if g('BC_WORKERS'): d['workers_per_gpu'] = int(g('BC_WORKERS'))
+    d['project_folder'] = 'results'
+    with open(out, 'w') as f:
+        json.dump(d, f, indent=2); f.write('\n')
+
+def count_rows(p):
+    try:
+        with open(p) as f:
+            return max(0, sum(1 for _ in f) - 1)
+    except IOError:
+        return 0
+
+def cmd_progress(camp):
+    try:
+        want = json.load(open(os.path.join(camp, 'settings.json'))).get('number_of_final_designs', 1)
+        mt = json.load(open(os.path.join(camp, 'settings.json'))).get('max_trajectories')
+    except Exception:
+        want, mt = '?', None
+    acc = count_rows(os.path.join(camp, 'results', '3_Ranked', '!_Ranked.csv'))
+    tra = count_rows(os.path.join(camp, 'results', '1_Trajectories', '!_Trajectories.csv'))
+    print('%s\t%s\t%s\t%s' % (acc, want, tra, mt if mt else '-'))
+
+def cmd_ranked(camp, n):
+    p = os.path.join(camp, 'results', '3_Ranked', '!_Ranked.csv')
+    if not os.path.exists(p):
+        print('(no accepted designs yet)'); return
+    rows = list(csv.DictReader(open(p)))
+    cols = [c for c in ('rank', 'design', 'length', 'i_pTM', 'i_pAE', 'i_pDAE', 'pLDDT') if rows and c in rows[0]]
+    print('  '.join('%-10s' % c if c != 'design' else '%-52s' % c for c in cols))
+    for r in rows[:int(n)]:
+        out = []
+        for c in cols:
+            v = r[c]
+            try:
+                if c not in ('rank', 'length', 'design'): v = '%.2f' % float(v)
+            except ValueError:
+                pass
+            out.append('%-52s' % v if c == 'design' else '%-10s' % v)
+        print('  '.join(out))
+    print('(%d accepted in total)' % len(rows))
+
+def cmd_jobs():
+    try:
+        root = ET.fromstring(sys.stdin.read())
+    except ET.ParseError:
+        return
+    for j in root.iter('job_list'):
+        g = lambda t: (j.findtext(t) or '').strip()
+        print('\t'.join([g('JB_name'), g('JB_job_number'), g('state'), g('queue_name') or '-']))
+
+def cmd_jsoncheck(p):
+    try:
+        json.load(open(p))
+    except Exception as e:
+        print(e); sys.exit(1)
+
+if __name__ == '__main__':
+    globals()['cmd_' + sys.argv[1]](*sys.argv[2:])
+PYEOF
+py() { python3 -c "$PYH" "$@"; }
+
+# ---------------------------------------------------------------- prompts
+ask() {   # ask VAR "Question" [default]     (locals are __-prefixed so they never shadow the caller's VAR)
+  local __v="$1" __q="$2" __d="${3:-}" __a
+  if [ -n "$__d" ]; then read -e -r -p "$__q [$__d]: " __a || die "input ended"; __a="${__a:-$__d}"
+  else read -e -r -p "$__q: " __a || die "input ended"; fi
+  __a="${__a/#\~/$HOME}"
+  printf -v "$__v" '%s' "$__a"
+}
+ask_yn() {  # ask_yn VAR "Question" y|n
+  local __v="$1" __q="$2" __d="${3:-y}" __a __h="Y/n"
+  [ "$__d" = n ] && __h="y/N"
+  while true; do
+    read -e -r -p "$__q [$__h]: " __a || die "input ended"
+    __a="${__a:-$__d}"
+    case "$__a" in y|Y|yes|YES) printf -v "$__v" y; return;; n|N|no|NO) printf -v "$__v" n; return;; esac
+    say "  please answer y or n"
+  done
+}
+ask_num() {  # ask_num VAR "Question" default min max
+  local __v="$1" __q="$2" __d="$3" __lo="$4" __hi="$5" __r
+  while true; do
+    ask __r "$__q" "$__d"
+    if [[ "$__r" =~ ^[0-9]+$ ]] && [ "$__r" -ge "$__lo" ] && [ "$__r" -le "$__hi" ]; then printf -v "$__v" '%s' "$__r"; return; fi
+    say "  enter a whole number from $__lo to $__hi"
+  done
+}
+menu() {  # menu VAR default_index "Title" item...   (numbered list; sets VAR to the 1-based choice)
+  local __v="$1" __d="$2" __t="$3"; shift 3
+  local __i=1 __item
+  say ""; say "$__t"
+  for __item in "$@"; do printf '  %s%d)%s %s\n' "$C" "$__i" "$N" "$__item"; __i=$((__i+1)); done
+  ask_num "$__v" "Choose" "$__d" 1 $#
+}
+
+# ---------------------------------------------------------------- config
+load_config() {
+  SIF="$BC2_HOME/bindcraft2.sif"; AF2DIR="$BC2_HOME/weights/alphafold"; IMAGE="$IMAGE_DEFAULT"
+  # shellcheck disable=SC1090
+  [ -f "$BC2_CONF" ] && . "$BC2_CONF"
+}
+save_config() {
+  mkdir -p "$BC2_HOME"
+  printf 'SIF=%q\nAF2DIR=%q\nIMAGE=%q\n' "$SIF" "$AF2DIR" "$IMAGE" > "$BC2_CONF"
+}
+weights_ok() {  # does $1 hold the AlphaFold models BindCraft2 needs?
+  local d="$1" m
+  [ -d "$d" ] || return 1
+  for m in $NEEDED_MODELS; do
+    [ -s "$d/params_$m.npz" ] || [ -s "$d/params/params_$m.npz" ] || return 1
+  done
+}
+resolve_weights_dir() {  # given a directory, print the one that holds params_*.npz
+  local d="$1"
+  for c in "$d" "$d/alphafold" "$d/params" "$d/alphafold/params"; do
+    if ls "$c"/params_*.npz >/dev/null 2>&1; then printf '%s' "$c"; return 0; fi
+  done
+  return 1
+}
+
+# ---------------------------------------------------------------- bc2 setup
+cmd_setup() {
+  local here=n sif_arg="" w_arg="" image="" slots=4
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --here) here=y;;
+      --sif) sif_arg="$2"; shift;;
+      --weights) w_arg="$2"; shift;;
+      --image) image="$2"; shift;;
+      -h|--help) cat <<EOF
+bc2 setup [--here] [--sif FILE] [--weights DIR] [--image NAME]
+
+One-time install into $BC2_HOME. By default it submits a batch job that
+  1. downloads the BindCraft2 container image ($IMAGE_DEFAULT)  (about 7 GB)
+  2. downloads the AlphaFold model weights                            (about 5 GB)
+so nothing heavy runs on the login node. Safe to run again: finished parts are skipped.
+
+  --here          do it right here instead of as a job (use if batch nodes cannot reach the internet)
+  --sif FILE      use a container image someone already shared with you instead of downloading
+  --weights DIR   use a folder that already holds params_model_*.npz instead of downloading
+  --image NAME    download a different image (default $IMAGE_DEFAULT)
+EOF
+        return 0;;
+      *) die "unknown option $1 (try: bc2 setup --help)";;
+    esac
+    shift
+  done
+  load_config
+  [ -n "$image" ] && IMAGE="$image"
+  mkdir -p "$BC2_HOME/logs" "$CAMPAIGNS" "$BC2_HOME/xla_cache" "$BC2_HOME/weights"
+  [ -n "$sif_arg" ] && { [ -s "$sif_arg" ] || die "no such file: $sif_arg"; SIF="$(cd "$(dirname "$sif_arg")" && pwd)/$(basename "$sif_arg")"; }
+  if [ -n "$w_arg" ]; then
+    local r; r="$(resolve_weights_dir "$w_arg")" || die "no params_*.npz files found in $w_arg (or its alphafold/ or params/ subfolder)"
+    AF2DIR="$r"
+  fi
+  save_config
+  head1 "BindCraft2 setup"
+  say "  install folder : $BC2_HOME"
+  say "  image          : $SIF"
+  say "  AF2 weights    : $AF2DIR"
+  local need_sif=n need_w=n
+  [ -s "$SIF" ] || need_sif=y
+  weights_ok "$AF2DIR" || need_w=y
+  if [ $need_sif = n ] && [ $need_w = n ]; then ok "everything is already in place"; cmd_check; return $?; fi
+  [ $need_sif = y ] && say "  -> will download the container image"
+  [ $need_w = y ] && say "  -> will download the AlphaFold weights"
+
+  local job="$BC2_HOME/setup.job"
+  cat > "$job" <<EOF
+#!/bin/bash
+# generated by bc2 setup
+export APPTAINER_CACHEDIR="\$TMPDIR/apptainer_cache" APPTAINER_TMPDIR="\$TMPDIR/apptainer_tmp"
+mkdir -p "\$APPTAINER_CACHEDIR" "\$APPTAINER_TMPDIR"
+echo "setup started \$(date) on \$(hostname)"
+if [ ! -s "$SIF" ]; then
+  echo "== downloading $IMAGE (several minutes; most of the time is packing the image)"
+  apptainer pull -F "$SIF.partial" "docker://$IMAGE" 2>&1 | grep -v -E 'warn xattr|^\$' | tail -20
+  [ -s "$SIF.partial" ] && mv "$SIF.partial" "$SIF" || { echo "image download FAILED"; exit 1; }
+fi
+if ! bash "$BC2_SELF" _weights_ok; then
+  echo "== downloading AlphaFold weights (about 5 GB)"
+  mkdir -p "$BC2_HOME/weights"
+  APPTAINERENV_BINDCRAFT_WEIGHTS=/w apptainer exec -e --bind "$BC2_HOME/weights:/w" "$SIF" bindcraft fetch-weights 2>&1 | tr '\\r' '\\n' | grep -v -E 'GreenCtx|cuda-nvcc|^ *[0-9.]+ of [0-9.]+ GB *\$' | tail -5
+fi
+echo "== checking"
+bash "$BC2_SELF" check
+echo "setup finished \$(date)"
+EOF
+  chmod +x "$job"
+  if [ $here = y ]; then
+    say ""; say "Running here (this can take 30+ minutes; if your connection drops it stops, so run it inside 'screen')..."
+    TMPDIR="${TMPDIR:-$BC2_HOME/tmp}"; mkdir -p "$TMPDIR"; export TMPDIR
+    bash "$job" 2>&1 | tee "$BC2_HOME/logs/setup.here.log"
+    return 0
+  fi
+  local out id
+  out="$(qsub -S /bin/bash -wd "$BC2_HOME" -j y -o "$BC2_HOME/logs/" -N bc2_setup -q UI -pe smp 4 "$job" 2>&1)" || die "qsub failed: $out"
+  id="$(printf '%s\n' "$out" | sed -n 's/^Your job \([0-9]*\).*/\1/p' | head -1)"
+  [ -n "$id" ] || die "could not read the job number from: $out"
+  say ""
+  ok "setup job $id submitted"
+  say "  watch it :  tail -f $BC2_HOME/logs/bc2_setup.o$id"
+  say "  when it prints 'setup finished', run:  bc2 new"
+}
+
+# ---------------------------------------------------------------- bc2 check
+cmd_check() {
+  load_config
+  local bad=0
+  head1 "BindCraft2 install check"
+  command -v apptainer >/dev/null 2>&1 && ok "apptainer: $(apptainer --version 2>/dev/null)" || { warn "apptainer not found (are you on an Argon login node?)"; bad=1; }
+  command -v qsub >/dev/null 2>&1 && ok "qsub (SGE) available" || { warn "qsub not found (are you on an Argon login node?)"; bad=1; }
+  if [ -s "$SIF" ]; then ok "container image: $SIF ($(du -h "$SIF" | cut -f1))"; else warn "container image missing: $SIF  -> run: bc2 setup"; bad=1; fi
+  if weights_ok "$AF2DIR"; then ok "AlphaFold weights: $AF2DIR"; else warn "AlphaFold weights incomplete in $AF2DIR  -> run: bc2 setup"; bad=1; fi
+  [ $bad = 0 ] && ok "ready: try  bc2 new" || return 1
+}
+
+# ---------------------------------------------------------------- campaigns
+camp_dir() { printf '%s/%s' "$CAMPAIGNS" "$1"; }
+need_camp() {
+  [ -n "${1:-}" ] || { say "which campaign?  existing ones:"; cmd_list; exit 1; }
+  [ -f "$(camp_dir "$1")/settings.json" ] || die "no campaign called '$1' (see: bc2 list)"
+}
+valid_name() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,40}$ ]]; }
+
+SHIPPED_NAMES=(hPDL1 mPDL1 hIL7RA hIL2R dynorphin_a hPD1)
+SHIPPED_RES=(115 116 195 387 40 115)
+SHIPPED_DESC=("Human PD-L1 (PD-1 interface as hotspots)  [115 residues]"
+              "Mouse PD-L1  [116 residues]"
+              "Human IL-7R alpha, one 10-residue patch targeted  [195 residues]"
+              "Human IL-2 receptor beta+gamma assembly  [387 residues, two chains]"
+              "Dynorphin A, a disordered 13-residue peptide  [sequence target]"
+              "Human PD-1, meant as an OFF-target to avoid, not usually a design target  [115 residues]")
+
+MOD_NAMES=(binder VHH scFv Fab ARP large_binder peptide cyclic_peptide homo_oligomer multidomain induced_fit fold_switch)
+MOD_DESC=("binder          new miniprotein binder, folded from nothing (the standard choice)"
+          "VHH             single-domain antibody (nanobody) with editable CDRs"
+          "scFv            single-chain antibody fragment (heavy + light variable domains)"
+          "Fab             antibody Fab fragment, editable variable domains"
+          "ARP             ankyrin-repeat protein scaffold"
+          "large_binder    a longer binder with extended optimisation (you must give lengths)"
+          "peptide         12-25 residue linear peptide"
+          "cyclic_peptide  7-20 residue peptide closed head to tail"
+          "homo_oligomer   identical copies of one 40-80 residue chain"
+          "multidomain     two domains on one 120-300 residue chain"
+          "induced_fit     interface must move >= 5 A on binding (usually combined with binder)"
+          "fold_switch     whole fold differs between free and bound (usually combined with binder)")
+LEN_MODS=" binder large_binder peptide cyclic_peptide homo_oligomer multidomain "
+
+PROP_NAMES=(humanize forced_targeting disulfide_staple mixed_topology protease_stable termini_accessible termini_together initial_guess bigbang)
+PROP_DESC=("humanize           human-like sequence preferences (good for therapeutics)"
+           "forced_targeting   concentrate the binder on your hotspots"
+           "disulfide_staple   allow cysteine and require a disulfide bond"
+           "mixed_topology     at most 50% helix and at least 20% beta sheet"
+           "protease_stable    avoid protease cleavage motifs and exposed loops"
+           "termini_accessible point both chain ends away from the target"
+           "termini_together   bring the N and C termini within 10 A"
+           "initial_guess      re-predict accepted designs from the folded pose"
+           "bigbang            start gradient stages from the coordinates on hand")
+
+pick_many() {  # pick_many VAR "Title" default_text names... :: descs...  (reads comma separated numbers)
+  :
+}
+
+ask_resources() {  # uses/sets: RQUEUE RGPU RSLOTS RWORKERS ; args: target_residues_for_estimate (0 = unknown) max_binder
+  local tres="${1:-0}" mb="${2:-0}" est_n=0 fitline="" best=1 qs q gi
+  head1 "Where to run it"
+  if [ "$tres" -gt 0 ] && [ "$mb" -gt 0 ]; then
+    local line
+    while IFS=$'\t' read -r k a b c; do
+      case "$k" in n) est_n="$a";; gib) est_gib="$a";; fit) fitline="$fitline$a: $b worker(s)   ";; esac
+    done < <(py estimate "$tres" "$mb")
+    say "  Size estimate: target $tres + binder up to $mb residues = about $est_n residues folded."
+    say "  BindCraft2 estimates ~${est_gib} GB of GPU memory per worker (real use measured ~25-35% lower)."
+    say "  Workers that fit on one card:  $fitline"
+  else
+    say "  (no size estimate for this binder type; start with 1 worker and watch memory in 'bc2 status')"
+  fi
+  RGPU_LIST=(L40S A40 A100 V100 any)
+  menu gi 1 "GPU type  (all four have been tested with BindCraft2 on Argon)" \
+    "L40S   48 GB  recommended: widely available" \
+    "A40    48 GB  also widely available" \
+    "A100   80 GB  fits the most workers at once, but UI-GPU often has a long wait; all.q starts fast but can be interrupted" \
+    "V100   32 GB  works, roughly 60% slower" \
+    "any    let the scheduler pick (excludes small old cards)"
+  RGPU="${RGPU_LIST[$((gi-1))]}"
+  qs="$(whichq 2>/dev/null | grep -E '^(UI-GPU|CCOM-GPU|UI-GPU-HM|all.q)$' | tr '\n' ' ')"
+  [ -n "$qs" ] || qs="UI-GPU all.q"
+  local qopts=() qdesc=() qq
+  for qq in $qs; do
+    qopts+=("$qq")
+    case "$qq" in
+      UI-GPU)     qdesc+=("UI-GPU      everyone; 1 running job at a time; never interrupted  (recommended)");;
+      CCOM-GPU)   qdesc+=("CCOM-GPU    your group's queue (L40S only); up to 5 jobs at once");;
+      UI-GPU-HM)  qdesc+=("UI-GPU-HM   big-memory GPU nodes; 24 h limit");;
+      all.q)      qdesc+=("all.q       no job limit, but can be interrupted at any time; rerun 'bc2 run' to resume");;
+    esac
+  done
+  local qdef=1 i
+  for i in "${!qopts[@]}"; do [ "${qopts[$i]}" = UI-GPU ] && qdef=$((i+1)); done
+  menu q "$qdef" "Queue" "${qdesc[@]}"
+  RQUEUE="${qopts[$((q-1))]}"
+  [ "$RQUEUE" = CCOM-GPU ] && [ "$RGPU" != L40S ] && { warn "CCOM-GPU only has L40S cards; using L40S"; RGPU=L40S; }
+  local wdef=2
+  [ -n "$fitline" ] && { case "$fitline" in *"L40S 48GB: 1 "*|*"L40S 48GB: 0 "*) wdef=1;; esac; }
+  [ "$tres" -le 0 ] && wdef=1
+  say ""
+  say "  Workers share one GPU to design in parallel (tested up to 3 per card)."
+  ask_num RWORKERS "Workers per GPU" "$wdef" 1 8
+  RSLOTS=8; [ "$RWORKERS" -ge 3 ] && RSLOTS=12; [ "$RWORKERS" -ge 5 ] && RSLOTS=16
+  say "  Memory: asking for $RSLOTS slots (about $((RSLOTS*4)) GB of RAM). Measured peak with up to 3 workers was 11-14 GB."
+}
+
+write_cfg() {  # write_cfg dir
+  printf 'RQUEUE=%q\nRGPU=%q\nRSLOTS=%q\n' "$RQUEUE" "$RGPU" "$RSLOTS" > "$1/bc2.cfg"
+}
+
+create_campaign_files() {  # expects BC_* env set; BC_NAME decides dir
+  local dir; dir="$(camp_dir "$BC_NAME")"
+  mkdir -p "$dir/logs"
+  if [ "$BC_KIND" = file ]; then
+    cp "$BC_TARGET" "$dir/$(basename "$BC_TARGET")" || die "could not copy $BC_TARGET"
+  fi
+  py mksettings "$dir/settings.json"
+  write_cfg "$dir"
+}
+
+cmd_new() {
+  load_config
+  local name="${1:-}"
+  head1 "New BindCraft2 campaign"
+  say "I will ask a few questions and write the files for you. Press Enter to accept the [default]."
+  say "(You can stop with Ctrl-C at any time; nothing is submitted until the end.)"
+  weights_ok "$AF2DIR" && [ -s "$SIF" ] || warn "the install is not finished yet (run: bc2 check)"
+
+  while true; do
+    ask name "Name for this campaign (letters, numbers, - and _)" "$name"
+    valid_name "$name" || { say "  use only letters, numbers, - and _ (no spaces)"; name=""; continue; }
+    if [ -f "$(camp_dir "$name")/settings.json" ]; then
+      local ow; ask_yn ow "  '$name' already exists. Overwrite its settings? (results are kept)" n
+      [ "$ow" = y ] && break; name=""; continue
+    fi
+    break
+  done
+
+  # ---- target
+  local tk tres=0 chains="" hot="" kind target
+  menu tk 1 "What do you want to design a binder against?" \
+    "A target BindCraft2 already includes (PD-L1, IL-2R, ...)" \
+    "My own structure file (.pdb, .cif) or sequence (.fasta)"
+  if [ "$tk" = 1 ]; then
+    kind=shipped
+    local sh; menu sh 1 "Included targets" "${SHIPPED_DESC[@]}"
+    target="${SHIPPED_NAMES[$((sh-1))]}"; tres="${SHIPPED_RES[$((sh-1))]}"
+  else
+    kind=file
+    while true; do
+      ask target "Path to your target file (Tab completes paths)"
+      [ -f "$target" ] || { say "  no such file: $target"; continue; }
+      py struct "$target" > "$BC2_HOME/.struct.tmp" 2> "$BC2_HOME/.struct.err" || { say "  $(cat "$BC2_HOME/.struct.err")"; continue; }
+      break
+    done
+    say ""
+    local firstchain="" nch=0 line
+    if grep -q '^fasta' "$BC2_HOME/.struct.tmp"; then
+      tres="$(cut -f2 "$BC2_HOME/.struct.tmp")"
+      say "  Sequence target with $tres residues. BindCraft2 will sample a window of it."
+      [ "$tres" -gt 40 ] && tres=40
+    else
+      say "  Found these chains in $(basename "$target"):"
+      while IFS=$'\t' read -r k c n lo hi; do
+        printf '    chain %s : %s residues (numbered %s-%s)\n' "$c" "$n" "$lo" "$hi"
+        [ -z "$firstchain" ] && firstchain="$c"; nch=$((nch+1))
+      done < <(grep '^chain' "$BC2_HOME/.struct.tmp")
+      while true; do
+        ask chains "Which chain(s) are the target? (e.g. A or A,B)" "$firstchain"
+        chains="${chains// /}"
+        local tot=0 ok1=y c
+        for c in ${chains//,/ }; do
+          line="$(awk -F'\t' -v c="$c" '$1=="chain" && $2==c {print $3}' "$BC2_HOME/.struct.tmp")"
+          if [ -z "$line" ]; then say "  chain $c is not in the file"; ok1=n; break; fi
+          tot=$((tot+line))
+        done
+        [ $ok1 = y ] && { tres=$tot; break; }
+      done
+      say ""
+      say "  ${D}Hotspots are the target residues you want the binder to touch (optional but recommended).${N}"
+      say "  ${D}Use residue numbers from your file, like: 54,56,66-70   (with several chains: A54,B12-16)${N}"
+      while true; do
+        ask hot "Hotspot residues (Enter to skip)" ""
+        [ -z "$hot" ] && break
+        hot="${hot// /}"
+        if msg="$(py hotspots "$target" "$chains" "$hot")"; then break; else say "$msg" | sed 's/^/  /'; fi
+      done
+    fi
+  fi
+
+  # ---- binder type
+  local mi picks mods="" props="" haslen=n
+  say ""; say "${B}What kind of binder?${N}  (pick one, or several separated by commas, e.g. 1,11)"
+  local i=1; for d in "${MOD_DESC[@]}"; do printf '  %s%2d)%s %s\n' "$C" "$i" "$N" "$d"; i=$((i+1)); done
+  while true; do
+    ask picks "Choose" "1"
+    mods=""; local okp=y p
+    for p in ${picks//,/ }; do
+      if [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le ${#MOD_NAMES[@]} ]; then mods="$mods${mods:+,}${MOD_NAMES[$((p-1))]}"; else okp=n; fi
+    done
+    [ $okp = y ] && [ -n "$mods" ] && break
+    say "  enter numbers from 1 to ${#MOD_NAMES[@]}, separated by commas"
+  done
+  for p in ${mods//,/ }; do case "$LEN_MODS" in *" $p "*) haslen=y;; esac; done
+
+  local lmin="" lmax="" mb=0
+  if [ $haslen = y ]; then
+    say ""
+    say "  ${D}Binder length in amino acids. A range lets BindCraft2 try different sizes; Enter keeps the preset.${N}"
+    while true; do
+      ask lmin "Shortest binder (Enter = preset)" ""
+      [ -z "$lmin" ] && break
+      if [[ "$lmin" =~ ^[0-9]+$ ]] && [ "$lmin" -ge 5 ]; then
+        ask lmax "Longest binder" "$lmin"
+        if [[ "$lmax" =~ ^[0-9]+$ ]] && [ "$lmax" -ge "$lmin" ]; then mb="$lmax"; break; fi
+        say "  the longest must be a number at least $lmin"
+      else say "  enter a number of at least 5"; fi
+    done
+    case ",$mods," in *,large_binder,*) [ -z "$lmin" ] && warn "large_binder works best when you give lengths too.";; esac
+    [ -z "$lmin" ] && lmax=""
+  fi
+  [ $haslen = y ] && [ "$mb" -eq 0 ] && mb=180   # assume the longest default range for the estimate
+  [ $haslen = n ] && mb=0
+
+  say ""; say "${B}Extra design properties${N}  (optional; comma-separated numbers, Enter for none)"
+  i=1; for d in "${PROP_DESC[@]}"; do printf '  %s%d)%s %s\n' "$C" "$i" "$N" "$d"; i=$((i+1)); done
+  while true; do
+    ask picks "Choose" ""
+    props=""; okp=y
+    for p in ${picks//,/ }; do
+      if [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le ${#PROP_NAMES[@]} ]; then props="$props${props:+,}${PROP_NAMES[$((p-1))]}"; else okp=n; fi
+    done
+    [ $okp = y ] && break
+    say "  enter numbers from 1 to ${#PROP_NAMES[@]}, or press Enter for none"
+  done
+
+  # ---- how many
+  local nfinal maxtraj
+  say ""
+  ask_num nfinal "How many accepted designs do you want?" 10 1 100000
+  say "  ${D}Most attempts are rejected by the quality filters, so many attempts are needed per accepted design.${N}"
+  say "  ${D}A cap stops a hard target from using the GPU forever. Enter 0 for no cap.${N}"
+  ask_num maxtraj "Give up after how many attempts?" 500 0 1000000
+  [ "$maxtraj" = 0 ] && maxtraj=""
+
+  ask_resources "$tres" "$mb"
+
+  export BC_NAME="$name" BC_KIND="$kind" BC_TARGET="$target" BC_CHAINS="$chains" BC_HOTSPOTS="$hot" \
+         BC_MODALITY="$mods" BC_PROPS="$props" BC_LEN_MIN="$lmin" BC_LEN_MAX="$lmax" \
+         BC_NFINAL="$nfinal" BC_MAXTRAJ="$maxtraj" BC_WORKERS="$RWORKERS"
+  create_campaign_files
+  local dir; dir="$(camp_dir "$name")"
+  head1 "Campaign '$name' is ready"
+  say "  folder   : $dir"
+  say "  settings : $dir/settings.json"
+  say ""; sed 's/^/    /' "$dir/settings.json"; say ""
+  say "  runs on  : ${RGPU} GPU in queue ${RQUEUE}, ${RSLOTS} slots"
+  say "  ${D}Change the settings later with:  bc2 edit $name   (or resources: bc2 resources $name)${N}"
+  local go; ask_yn go "Submit it to the queue now?" y
+  if [ "$go" = y ]; then cmd_run "$name"; else say "Submit later with:  bc2 run $name"; fi
+}
+
+# ---------------------------------------------------------------- bc2 run
+gpu_flags() {  # prints qsub resource flags for $RGPU
+  case "$1" in
+    any) printf -- '-l ngpus=1 -l gpu_1080ti=false -l gpu_2080ti=false -l gpu_titanv=false -l gpu_titanv_jhh=false -l gpu_l4=false -l gpu_p40=false -l gpu_p100=false -l gpu_k80=false';;
+    L40S) printf -- '-l ngpus=1 -l gpu_l40s=true';;
+    A40)  printf -- '-l ngpus=1 -l gpu_a40=true';;
+    A100) printf -- '-l ngpus=1 -l gpu_a100=true';;
+    V100) printf -- '-l ngpus=1 -l gpu_v100=true';;
+    *) die "unknown GPU type '$1'";;
+  esac
+}
+
+write_job() {  # write_job dir name
+  local dir="$1" name="$2"
+  cat > "$dir/job.sh" <<EOF
+#!/bin/bash
+# generated by bc2 -- do not edit; change settings.json or run 'bc2 resources $name'
+export APPTAINERENV_BINDCRAFT_AF2_PARAMS=/af2params
+export APPTAINERENV_JAX_COMPILATION_CACHE_DIR=/xla_cache
+[ -n "\${CUDA_VISIBLE_DEVICES:-}" ] && export APPTAINERENV_CUDA_VISIBLE_DEVICES="\$CUDA_VISIBLE_DEVICES"
+cd "$dir" || exit 1
+echo "campaign $name on \$(hostname) at \$(date)"
+nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader 2>/dev/null | head -2
+stop() { echo; echo "*** job was stopped (cancelled, or interrupted on all.q). Run: bc2 run $name   to continue where it left off."; kill \$child 2>/dev/null; wait \$child 2>/dev/null; exit 143; }
+trap stop TERM INT
+apptainer exec -e --bind "$AF2DIR:/af2params" --bind "$BC2_HOME/xla_cache:/xla_cache" --bind "$dir:$dir" --pwd "$dir" "$SIF" bindcraft design settings.json > >(grep -v -E 'GreenCtx|cuda-nvcc') 2>&1 &
+child=\$!
+wait \$child
+echo "campaign finished (exit \$?) at \$(date)"
+EOF
+  chmod +x "$dir/job.sh"
+}
+
+cmd_run() {
+  local name="" dry=n a
+  for a in "$@"; do case "$a" in --dry-run) dry=y;; -*) die "unknown option $a";; *) name="$a";; esac; done
+  need_camp "$name"
+  load_config
+  [ -s "$SIF" ] || die "container image missing ($SIF). Run: bc2 setup"
+  weights_ok "$AF2DIR" || die "AlphaFold weights are not set up. Run: bc2 setup"
+  local dir; dir="$(camp_dir "$name")"
+  err="$(py jsoncheck "$dir/settings.json")" || die "settings.json is not valid JSON: $err"
+  [ -f "$dir/bc2.cfg" ] && . "$dir/bc2.cfg" || die "missing resources file; run: bc2 resources $name"
+  if qstat -u "$USER" -xml 2>/dev/null | py jobs | awk -F'\t' -v n="bc2_$name" '$1==n{f=1} END{exit !f}'; then
+    die "'$name' is already queued or running (see: bc2 status $name)"
+  fi
+  mkdir -p "$dir/logs"
+  write_job "$dir" "$name"
+  local flags; flags="$(gpu_flags "$RGPU")"
+  local base=(-S /bin/bash -wd "$dir" -j y -o "$dir/logs/" -N "bc2_$name" -q "$RQUEUE" -pe smp "$RSLOTS" -l mps=4)
+  # shellcheck disable=SC2206
+  local all=("${base[@]}" $flags "$dir/job.sh")
+  local vout
+  vout="$(qsub -w v "${all[@]}" 2>&1)" || true
+  case "$vout" in *"found suitable queue"*) ;; *) die "the scheduler will not accept this request:"$'\n'"$vout"$'\n'"Try: bc2 resources $name";; esac
+  if [ $dry = y ]; then ok "dry run: the request is valid ($RGPU, queue $RQUEUE, $RSLOTS slots). Nothing submitted."; say "  qsub ${all[*]}"; return 0; fi
+  local out id
+  out="$(qsub "${all[@]}" 2>&1)" || die "qsub failed: $out"
+  id="$(printf '%s\n' "$out" | sed -n 's/^Your job \([0-9]*\).*/\1/p' | head -1)"
+  ok "submitted '$name' as job ${id:-?}  ($RGPU, queue $RQUEUE)"
+  say "  see progress :  bc2 status $name"
+  say "  live log     :  tail -f $dir/logs/bc2_$name.o${id:-JOBID}"
+  say "  stop it      :  bc2 cancel $name      (run again later to resume)"
+}
+
+# ---------------------------------------------------------------- status, results, cancel, list, edit, resources
+job_of() {  # print "id state queue" for campaign $1 if queued/running
+  qstat -u "$USER" -xml 2>/dev/null | py jobs | awk -F'\t' -v n="bc2_$1" '$1==n {print $2" "$3" "$4}' | head -1
+}
+state_word() { case "$1" in r|t) echo running;; qw|hqw) echo waiting;; Eqw) echo ERROR;; *) echo "$1";; esac; }
+
+cmd_list() {
+  [ -d "$CAMPAIGNS" ] || { say "no campaigns yet. Start one with: bc2 new"; return 0; }
+  local n=0 d name j acc want tra mt
+  printf '%s%-22s %-10s %-14s %-14s%s\n' "$B" CAMPAIGN JOB "ACCEPTED" "ATTEMPTS" "$N"
+  for d in "$CAMPAIGNS"/*/; do
+    [ -f "$d/settings.json" ] || continue
+    name="$(basename "$d")"; n=$((n+1))
+    j="$(job_of "$name")"
+    read -r acc want tra mt < <(py progress "${d%/}" | tr '\t' ' ')
+    printf '%-22s %-10s %-14s %-14s\n' "$name" "$([ -n "$j" ] && state_word "$(echo "$j" | cut -d' ' -f2)" || echo -)" "$acc / $want" "$tra / $mt"
+  done
+  [ $n = 0 ] && say "no campaigns yet. Start one with: bc2 new"
+  return 0
+}
+
+cmd_status() {
+  local name="${1:-}"
+  [ -z "$name" ] && { cmd_list; return; }
+  need_camp "$name"
+  local dir j acc want tra mt
+  dir="$(camp_dir "$name")"
+  j="$(job_of "$name")"
+  head1 "Campaign $name"
+  if [ -n "$j" ]; then
+    set -- $j
+    say "  job      : $1  ($(state_word "$2")${3:+, $3})"
+    [ "$2" = Eqw ] && warn "the job is in an error state; see: qstat -j $1   (cancel with: bc2 cancel $name)"
+    [ "$(state_word "$2")" = waiting ] && say "  ${D}waiting for a free GPU; check queue load with:  qstat -g c -q $(. "$dir/bc2.cfg"; echo "$RQUEUE")${N}"
+  else say "  job      : not running"; fi
+  read -r acc want tra mt < <(py progress "$dir" | tr '\t' ' ')
+  say "  accepted : $acc of $want requested designs"
+  say "  attempts : $tra tried (cap: $mt)"
+  local lg; lg="$(ls -t "$dir"/logs/bc2_"$name".o* 2>/dev/null | head -1)"
+  if [ -n "$lg" ]; then
+    say "  log      : $lg"
+    say "${D}  last lines:${N}"; tail -n 5 "$lg" | cut -c1-150 | sed 's/^/    /'
+  fi
+  [ "$acc" -gt 0 ] 2>/dev/null && say "  best designs so far:  bc2 results $name"
+  return 0
+}
+
+cmd_results() {
+  local name="${1:-}" n="${2:-10}"
+  need_camp "$name"
+  local dir; dir="$(camp_dir "$name")"
+  head1 "Top designs for $name"
+  py ranked "$dir" "$n"
+  say ""
+  say "  folder : $dir/results/3_Ranked      (structures .cif, table !_Ranked.csv)"
+  say "  all attempts: $dir/results/1_Trajectories"
+  say ""
+  say "  Copy to your computer (run this on YOUR computer, not on Argon):"
+  say "    scp -r $USER@argon.hpc.uiowa.edu:$dir/results/3_Ranked ./${name}_ranked"
+}
+
+cmd_cancel() {
+  need_camp "${1:-}"
+  local j; j="$(job_of "$1")"
+  [ -n "$j" ] || { say "'$1' is not queued or running."; return 0; }
+  qdel "${j%% *}" >/dev/null 2>&1 && ok "cancelled job ${j%% *}. Run 'bc2 run $1' later to resume." || die "qdel failed"
+}
+
+cmd_edit() {
+  need_camp "${1:-}"
+  local dir; dir="$(camp_dir "$1")"
+  # shellcheck disable=SC2086   (EDITOR may hold several words, like "code -w")
+  ${EDITOR:-nano} "$dir/settings.json"
+  if err="$(py jsoncheck "$dir/settings.json")"; then ok "settings.json is valid JSON. Submit with: bc2 run $1"
+  else warn "settings.json has a typo: $err"; warn "run 'bc2 edit $1' again to fix it before submitting"; fi
+}
+
+cmd_resources() {
+  need_camp "${1:-}"
+  local dir; dir="$(camp_dir "$1")"
+  ask_resources 0 0
+  write_cfg "$dir"
+  # keep workers_per_gpu in settings.json in step with what was chosen
+  python3 - "$dir/settings.json" "$RWORKERS" <<'PYX'
+import json, sys, collections
+p, w = sys.argv[1], int(sys.argv[2])
+d = json.load(open(p), object_pairs_hook=collections.OrderedDict)
+d['workers_per_gpu'] = w
+json.dump(d, open(p, 'w'), indent=2); open(p, 'a').write('\n')
+PYX
+  ok "saved. Submit with: bc2 run $1"
+}
+
+cmd_test() {
+  load_config
+  local name="${1:-smoke-test}"
+  say "Creates a tiny campaign (hPDL1, 1 design, at most 4 attempts, 1 worker) to prove your install works end to end."
+  export BC_NAME="$name" BC_KIND=shipped BC_TARGET=hPDL1 BC_CHAINS="" BC_HOTSPOTS="" BC_MODALITY=binder BC_PROPS="" \
+         BC_LEN_MIN="" BC_LEN_MAX="" BC_NFINAL=1 BC_MAXTRAJ=4 BC_WORKERS=1
+  RQUEUE="${BC2_QUEUE:-UI-GPU}"; RGPU="${BC2_GPU:-L40S}"; RSLOTS=8
+  create_campaign_files
+  ok "created campaign '$name'"
+  cmd_run "$name"
+}
+
+cmd_help() {
+  cat <<EOF
+${B}bc2${N} $BC2_VERSION -- run BindCraft2 on Argon without editing files by hand
+
+${B}First time${N}
+  bc2 setup                 download the container and AlphaFold weights (runs as a batch job; ~30-60 min once)
+  bc2 test                  optional: a tiny run that proves everything works
+
+${B}Every project${N}
+  bc2 new [NAME]            guided questions -> a ready-to-run campaign
+  bc2 run NAME              submit it (run again to resume after a stop)
+  bc2 status [NAME]         what is running and how many designs are accepted
+  bc2 results NAME [N]      the best N designs and how to copy them off Argon
+  bc2 cancel NAME           stop it (progress is kept)
+
+${B}Tweaking${N}
+  bc2 edit NAME             edit settings.json in nano (set EDITOR=vim if you prefer)
+  bc2 resources NAME        change GPU type, queue, workers
+  bc2 run NAME --dry-run    check the request without submitting
+  bc2 list                  all campaigns
+  bc2 check                 is the install complete?
+
+Files live in $BC2_HOME  (campaigns in $BC2_HOME/campaigns/NAME).
+EOF
+}
+
+# ---------------------------------------------------------------- dispatch
+sub="${1:-help}"; [ $# -gt 0 ] && shift
+case "$sub" in
+  setup) cmd_setup "$@";;
+  check) cmd_check "$@";;
+  new) cmd_new "$@";;
+  run|resume|submit) cmd_run "$@";;
+  status|st) cmd_status "$@";;
+  results|top) cmd_results "$@";;
+  cancel|stop) cmd_cancel "$@";;
+  list|ls) cmd_list "$@";;
+  edit) cmd_edit "$@";;
+  resources) cmd_resources "$@";;
+  test) cmd_test "$@";;
+  _weights_ok) load_config; weights_ok "$AF2DIR";;
+  help|-h|--help) cmd_help;;
+  version|--version) say "bc2 $BC2_VERSION";;
+  *) say "unknown command '$sub'"; cmd_help; exit 1;;
+esac
