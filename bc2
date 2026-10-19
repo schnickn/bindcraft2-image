@@ -396,7 +396,7 @@ MOD_DESC=("binder          new miniprotein binder, folded from nothing (the stan
           "fold_switch     whole fold differs between free and bound (usually combined with binder)")
 LEN_MODS=" binder large_binder peptide cyclic_peptide homo_oligomer multidomain "
 
-PROP_NAMES=(humanize forced_targeting disulfide_staple mixed_topology protease_stable termini_accessible termini_together initial_guess bigbang)
+PROP_NAMES=(humanize forced_targeting disulfide_staple mixed_topology protease_stable termini_accessible termini_together hard_target large_complex)
 PROP_DESC=("humanize           human-like sequence preferences (good for therapeutics)"
            "forced_targeting   concentrate the binder on your hotspots"
            "disulfide_staple   allow cysteine and require a disulfide bond"
@@ -404,8 +404,30 @@ PROP_DESC=("humanize           human-like sequence preferences (good for therape
            "protease_stable    avoid protease cleavage motifs and exposed loops"
            "termini_accessible point both chain ends away from the target"
            "termini_together   bring the N and C termini within 10 A"
-           "initial_guess      re-predict accepted designs from the folded pose"
-           "bigbang            start gradient stages from the coordinates on hand")
+           "hard_target        re-predict accepted designs from the folded pose (for hard targets)"
+           "large_complex      start gradient stages from the coordinates on hand (for large complexes)")
+
+# Property names change between BindCraft2 versions (1.0.4 renamed bigbang to large_complex and
+# initial_guess to hard_target), so ask the installed image which ones it has: keep the described
+# ones it still knows, and add any new ones with a plain label. Falls back to the table above.
+refresh_props() {
+  [ -s "$SIF" ] || return 0
+  local cache="$BC2_HOME/.properties" have="" i n
+  if [ ! -s "$cache" ] || [ "$SIF" -nt "$cache" ]; then
+    apptainer exec -e "$SIF" bindcraft design --list-properties 2>/dev/null | grep -E '^[a-z][a-z0-9_]*$' > "$cache.tmp" 2>/dev/null && mv -f "$cache.tmp" "$cache"
+    rm -f "$cache.tmp"
+  fi
+  [ -s "$cache" ] || return 0
+  have="$(tr '\n' ' ' < "$cache")"
+  local nn=() dd=()
+  for i in "${!PROP_NAMES[@]}"; do
+    case " $have " in *" ${PROP_NAMES[$i]} "*) nn+=("${PROP_NAMES[$i]}"); dd+=("${PROP_DESC[$i]}");; esac
+  done
+  for n in $have; do
+    case " ${nn[*]-} " in *" $n "*) ;; *) nn+=("$n"); dd+=("$(printf '%-19s' "$n") (new in this BindCraft2 version; see its documentation)");; esac
+  done
+  PROP_NAMES=("${nn[@]}"); PROP_DESC=("${dd[@]}")
+}
 
 pick_many() {  # pick_many VAR "Title" default_text names... :: descs...  (reads comma separated numbers)
   :
@@ -578,6 +600,7 @@ cmd_new() {
   [ $haslen = y ] && [ "$mb" -eq 0 ] && mb=180   # assume the longest default range for the estimate
   [ $haslen = n ] && mb=0
 
+  refresh_props
   say ""; say "${B}Extra design properties${N}  (optional; comma-separated numbers, Enter for none)"
   i=1; for d in "${PROP_DESC[@]}"; do printf '  %s%d)%s %s\n' "$C" "$i" "$N" "$d"; i=$((i+1)); done
   while true; do

@@ -4,19 +4,25 @@ name: Build BindCraft2 image
 # differs from upstream's only by the ACCEL build arg, and pushes linux/amd64 to ghcr.io.
 #
 # Run it from the Actions tab (Run workflow), or push a change to the Dockerfile or this file.
-# The image lands at ghcr.io/<owner>/bindcraft2:<accel> and ghcr.io/<owner>/bindcraft2:<accel>-<upstream sha>.
+# Every build is published as ghcr.io/<owner>/bindcraft2:<accel>-<upstream sha> (and :<accel>-vX.Y.Z when the
+# ref is a release tag). The moving tag ghcr.io/<owner>/bindcraft2:<accel>, which `bc2 setup` pulls, only moves
+# when "move_tag" is ticked, so a new version can be tested before anyone is switched to it.
 
 on:
   workflow_dispatch:
     inputs:
       upstream_ref:
         description: BindCraft2 commit, tag or branch to build
-        default: c0ee638d11bc010817c2c97ee58ed5c323e664e2
+        default: d502f19a187a1bc8c05e833ca9cbab7bc1934fe7
       accel:
         description: CUDA wheel set (cuda12 runs on driver >= 525; cuda13 needs driver >= 580)
         type: choice
         options: [cuda12, cuda13]
         default: cuda12
+      move_tag:
+        description: Also move the plain :<accel> tag (the one bc2 setup pulls) to this build
+        type: boolean
+        default: false
   push:
     paths: [Dockerfile, .github/workflows/build.yml]
 
@@ -25,7 +31,7 @@ permissions:
   packages: write
 
 env:
-  UPSTREAM_REF_DEFAULT: c0ee638d11bc010817c2c97ee58ed5c323e664e2
+  UPSTREAM_REF_DEFAULT: d502f19a187a1bc8c05e833ca9cbab7bc1934fe7
   ACCEL_DEFAULT: cuda12
 
 jobs:
@@ -47,6 +53,7 @@ jobs:
         env:
           IN_REF: ${{ inputs.upstream_ref }}
           IN_ACCEL: ${{ inputs.accel }}
+          IN_MOVE: ${{ inputs.move_tag }}
           OWNER: ${{ github.repository_owner }}
         run: |
           ref="${IN_REF:-$UPSTREAM_REF_DEFAULT}"
@@ -54,6 +61,7 @@ jobs:
           owner="$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')"
           echo "ref=$ref"     >> "$GITHUB_OUTPUT"
           echo "accel=$accel" >> "$GITHUB_OUTPUT"
+          echo "move=${IN_MOVE:-false}" >> "$GITHUB_OUTPUT"
           echo "image=ghcr.io/$owner/bindcraft2" >> "$GITHUB_OUTPUT"
 
       - name: Check out BindCraft2
@@ -63,13 +71,24 @@ jobs:
           ref: ${{ steps.cfg.outputs.ref }}
           path: upstream
 
-      - name: Record the upstream commit
+      - name: Record the upstream commit and work out the tags
         id: up
+        env:
+          IMAGE: ${{ steps.cfg.outputs.image }}
+          ACCEL: ${{ steps.cfg.outputs.accel }}
+          REF: ${{ steps.cfg.outputs.ref }}
+          MOVE: ${{ steps.cfg.outputs.move }}
         run: |
           sha="$(git -C upstream rev-parse HEAD)"
+          short="${sha:0:7}"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "short=${sha:0:7}" >> "$GITHUB_OUTPUT"
+          echo "short=$short" >> "$GITHUB_OUTPUT"
           rm -rf upstream/.git
+          tags="$IMAGE:$ACCEL-$short"
+          if [[ "$REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then tags="$tags"$'\n'"$IMAGE:$ACCEL-$REF"; fi
+          if [ "$MOVE" = "true" ]; then tags="$tags"$'\n'"$IMAGE:$ACCEL"; fi
+          { echo "tags<<EOF"; echo "$tags"; echo "EOF"; } >> "$GITHUB_OUTPUT"
+          echo "will publish:"; echo "$tags"
 
       - uses: docker/setup-buildx-action@v3
 
@@ -87,9 +106,7 @@ jobs:
           platforms: linux/amd64
           push: true
           build-args: ACCEL=${{ steps.cfg.outputs.accel }}
-          tags: |
-            ${{ steps.cfg.outputs.image }}:${{ steps.cfg.outputs.accel }}
-            ${{ steps.cfg.outputs.image }}:${{ steps.cfg.outputs.accel }}-${{ steps.up.outputs.short }}
+          tags: ${{ steps.up.outputs.tags }}
           labels: |
             org.opencontainers.image.title=BindCraft2 (${{ steps.cfg.outputs.accel }})
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
@@ -100,6 +117,7 @@ jobs:
         run: |
           img='${{ steps.cfg.outputs.image }}:${{ steps.cfg.outputs.accel }}-${{ steps.up.outputs.short }}'
           docker run --rm "$img" --help | head -5
+          docker run --rm "$img" design --list-properties | tr '\n' ' '; echo
           docker run --rm --entrypoint python3 "$img" -c "import jax; print('jax', jax.__version__)"
           docker run --rm --entrypoint python3 "$img" -m bindcraft.selfcheck '${{ steps.cfg.outputs.accel }}' --shipped-only && echo selfcheck ok
           docker image inspect "$img" --format 'image size: {{.Size}} bytes'

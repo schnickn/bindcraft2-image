@@ -35,10 +35,11 @@ reference is in [docs/bc2.md](docs/bc2.md).
 
 Upstream's `containers/Dockerfile` installs the `cuda13` wheels, which need NVIDIA driver >= 580.
 Argon's GPU nodes run driver 535 (CUDA 12.2), so the stock image finds no GPU there. `Dockerfile` here is
-upstream's file at commit `c0ee638` plus an `ACCEL` build argument (default `cuda12`).
+upstream's file (unchanged between `c0ee638` and v1.0.4) plus an `ACCEL` build argument (default `cuda12`).
 The GitHub Actions workflow (`.github/workflows/build.yml`) builds it for `linux/amd64` and publishes
-`ghcr.io/schnickn/bindcraft2:cuda12`, which `bc2 setup` downloads. Run the workflow from the Actions tab to
-rebuild, or to build `cuda13` or a different upstream commit.
+`ghcr.io/schnickn/bindcraft2:cuda12-<upstream commit>`. The plain `:cuda12` tag, which `bc2 setup` downloads,
+only moves when you tick "move_tag" on a manual run, so a new BindCraft2 version can be tested first. Run the
+workflow from the Actions tab to build `cuda13` or a different upstream commit or release tag.
 
 ## What has been tested
 
