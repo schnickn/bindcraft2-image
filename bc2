@@ -433,7 +433,7 @@ pick_many() {  # pick_many VAR "Title" default_text names... :: descs...  (reads
   :
 }
 
-ask_resources() {  # uses/sets: RQUEUE RGPU RSLOTS RWORKERS ; args: target_residues_for_estimate (0 = unknown) max_binder
+ask_resources() {  # uses/sets: RQUEUE RGPU RGPUS RSLOTS RWORKERS ; args: target_residues_for_estimate (0 = unknown) max_binder
   local tres="${1:-0}" mb="${2:-0}" est_n=0 fitline="" best=1 qs q gi
   head1 "Where to run it"
   if [ "$tres" -gt 0 ] && [ "$mb" -gt 0 ]; then
@@ -476,14 +476,25 @@ ask_resources() {  # uses/sets: RQUEUE RGPU RSLOTS RWORKERS ; args: target_resid
   [ -n "$fitline" ] && { case "$fitline" in *"L40S 48GB: 1 "*|*"L40S 48GB: 0 "*) wdef=1;; esac; }
   [ "$tres" -le 0 ] && wdef=1
   say ""
+  say "  One campaign can use several GPUs on a single node at once (same type), which multiplies how many"
+  say "  designs you get per hour. ${D}Tested with 4 L40S GPUs. A100 and V100 requests usually allow only 1;${N}"
+  say "  ${D}the scheduler checks the request when you submit and tells you if the node cannot supply it.${N}"
+  ask_num RGPUS "GPUs for this campaign" 1 1 4
+  say ""
   say "  Workers share one GPU to design in parallel (tested up to 3 per card)."
   ask_num RWORKERS "Workers per GPU" "$wdef" 1 8
-  RSLOTS=8; [ "$RWORKERS" -ge 3 ] && RSLOTS=12; [ "$RWORKERS" -ge 5 ] && RSLOTS=16
-  say "  Memory: asking for $RSLOTS slots (about $((RSLOTS*4)) GB of RAM). Measured peak with up to 3 workers was 11-14 GB."
+  RTOTAL=$((RGPUS * RWORKERS))
+  # host memory: measured 11-14 GB for up to 3 workers, 34 GB (cold cache) for 8 workers on 4 GPUs
+  RSLOTS=8
+  [ "$RTOTAL" -ge 3 ] && RSLOTS=12
+  [ "$RTOTAL" -ge 5 ] && RSLOTS=16
+  [ "$RTOTAL" -ge 9 ] && RSLOTS=20
+  [ "$RTOTAL" -ge 13 ] && RSLOTS=24
+  say "  $RTOTAL worker(s) in total. Memory: asking for $RSLOTS slots (about $((RSLOTS*4)) GB of RAM)."
 }
 
 write_cfg() {  # write_cfg dir
-  printf 'RQUEUE=%q\nRGPU=%q\nRSLOTS=%q\n' "$RQUEUE" "$RGPU" "$RSLOTS" > "$1/bc2.cfg"
+  printf 'RQUEUE=%q\nRGPU=%q\nRGPUS=%q\nRSLOTS=%q\n' "$RQUEUE" "$RGPU" "${RGPUS:-1}" "$RSLOTS" > "$1/bc2.cfg"
 }
 
 create_campaign_files() {  # expects BC_* env set; BC_NAME decides dir
@@ -633,22 +644,25 @@ cmd_new() {
   say "  folder   : $dir"
   say "  settings : $dir/settings.json"
   say ""; sed 's/^/    /' "$dir/settings.json"; say ""
-  say "  runs on  : ${RGPU} GPU in queue ${RQUEUE}, ${RSLOTS} slots"
+  say "  runs on  : ${RGPUS} x ${RGPU} GPU in queue ${RQUEUE}, ${RSLOTS} slots (${RTOTAL} worker(s) in total)"
+  [ -n "$maxtraj" ] && [ "$maxtraj" -lt "$RTOTAL" ] && warn "your attempt cap ($maxtraj) is below the number of workers ($RTOTAL); BindCraft2 will start only $maxtraj of them."
   say "  ${D}Change the settings later with:  bc2 edit $name   (or resources: bc2 resources $name)${N}"
   local go; ask_yn go "Submit it to the queue now?" y
   if [ "$go" = y ]; then cmd_run "$name"; else say "Submit later with:  bc2 run $name"; fi
 }
 
 # ---------------------------------------------------------------- bc2 run
-gpu_flags() {  # prints qsub resource flags for $RGPU
+gpu_flags() {  # gpu_flags TYPE COUNT : qsub resource flags for COUNT GPUs of TYPE on one node
+  local n="${2:-1}" t=""
   case "$1" in
-    any) printf -- '-l ngpus=1 -l gpu_1080ti=false -l gpu_2080ti=false -l gpu_titanv=false -l gpu_titanv_jhh=false -l gpu_l4=false -l gpu_p40=false -l gpu_p100=false -l gpu_k80=false';;
-    L40S) printf -- '-l ngpus=1 -l gpu_l40s=true';;
-    A40)  printf -- '-l ngpus=1 -l gpu_a40=true';;
-    A100) printf -- '-l ngpus=1 -l gpu_a100=true';;
-    V100) printf -- '-l ngpus=1 -l gpu_v100=true';;
+    any) t="-l gpu_1080ti=false -l gpu_2080ti=false -l gpu_titanv=false -l gpu_titanv_jhh=false -l gpu_l4=false -l gpu_p40=false -l gpu_p100=false -l gpu_k80=false";;
+    L40S) t="-l gpu_l40s=true";;
+    A40)  t="-l gpu_a40=true";;
+    A100) t="-l gpu_a100=true";;
+    V100) t="-l gpu_v100=true";;
     *) die "unknown GPU type '$1'";;
   esac
+  printf -- '-l ngpus=%s %s' "$n" "$t"
 }
 
 write_job() {  # write_job dir name
@@ -681,24 +695,25 @@ cmd_run() {
   weights_ok "$AF2DIR" || die "AlphaFold weights are not set up. Run: bc2 setup"
   local dir; dir="$(camp_dir "$name")"
   err="$(py jsoncheck "$dir/settings.json")" || die "settings.json is not valid JSON: $err"
+  RGPUS=1   # campaigns made before the GPU-count option have no RGPUS line
   [ -f "$dir/bc2.cfg" ] && . "$dir/bc2.cfg" || die "missing resources file; run: bc2 resources $name"
   if qstat -u "$USER" -xml 2>/dev/null | py jobs | awk -F'\t' -v n="bc2_$name" '$1==n{f=1} END{exit !f}'; then
     die "'$name' is already queued or running (see: bc2 status $name)"
   fi
   mkdir -p "$dir/logs"
   write_job "$dir" "$name"
-  local flags; flags="$(gpu_flags "$RGPU")"
+  local flags; flags="$(gpu_flags "$RGPU" "${RGPUS:-1}")"
   local base=(-S /bin/bash -wd "$dir" -j y -o "$dir/logs/" -N "bc2_$name" -q "$RQUEUE" -pe smp "$RSLOTS" -l mps=4)
   # shellcheck disable=SC2206
   local all=("${base[@]}" $flags "$dir/job.sh")
   local vout
   vout="$(qsub -w v "${all[@]}" 2>&1)" || true
-  case "$vout" in *"found suitable queue"*) ;; *) die "the scheduler will not accept this request:"$'\n'"$vout"$'\n'"Try: bc2 resources $name";; esac
-  if [ $dry = y ]; then ok "dry run: the request is valid ($RGPU, queue $RQUEUE, $RSLOTS slots). Nothing submitted."; say "  qsub ${all[*]}"; return 0; fi
+  case "$vout" in *"found suitable queue"*) ;; *) die "the scheduler will not accept this request ($(printf '%s' "$vout" | head -1 | cut -c1-110)...)"$'\n'"  Asked for: ${RGPUS:-1} x $RGPU GPU in queue $RQUEUE with $RSLOTS slots."$'\n'"  Try: bc2 resources $name   (several GPUs of one type are not always available on one node: A100 and V100 usually allow only 1, so try 1 GPU, or an L40S or A40)";; esac
+  if [ $dry = y ]; then ok "dry run: the request is valid (${RGPUS:-1} x $RGPU, queue $RQUEUE, $RSLOTS slots). Nothing submitted."; say "  qsub ${all[*]}"; return 0; fi
   local out id
   out="$(qsub "${all[@]}" 2>&1)" || die "qsub failed: $out"
   id="$(printf '%s\n' "$out" | sed -n 's/^Your job \([0-9]*\).*/\1/p' | head -1)"
-  ok "submitted '$name' as job ${id:-?}  ($RGPU, queue $RQUEUE)"
+  ok "submitted '$name' as job ${id:-?}  (${RGPUS:-1} x $RGPU, queue $RQUEUE)"
   say "  see progress :  bc2 status $name"
   say "  live log     :  tail -f $dir/logs/bc2_$name.o${id:-JOBID}"
   say "  stop it      :  bc2 cancel $name      (run again later to resume)"
@@ -803,7 +818,7 @@ cmd_test() {
   say "Creates a tiny campaign (hPDL1, 1 design, at most 4 attempts, 1 worker) to prove your install works end to end."
   export BC_NAME="$name" BC_KIND=shipped BC_TARGET=hPDL1 BC_CHAINS="" BC_HOTSPOTS="" BC_MODALITY=binder BC_PROPS="" \
          BC_LEN_MIN="" BC_LEN_MAX="" BC_NFINAL=1 BC_MAXTRAJ=4 BC_WORKERS=1
-  RQUEUE="${BC2_QUEUE:-UI-GPU}"; RGPU="${BC2_GPU:-L40S}"; RSLOTS=8
+  RQUEUE="${BC2_QUEUE:-UI-GPU}"; RGPU="${BC2_GPU:-L40S}"; RGPUS=1; RSLOTS=8
   create_campaign_files
   ok "created campaign '$name'"
   cmd_run "$name"

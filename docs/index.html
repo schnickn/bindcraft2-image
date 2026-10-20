@@ -315,6 +315,8 @@ footer{background:var(--black);color:#b9b9c0;border-top:6px solid var(--gold);pa
         <select id="b-gpu"><option value="L40S">L40S (48 GB), recommended</option><option value="A40">A40 (48 GB)</option><option value="A100">A100 (80 GB)</option><option value="V100">V100 (32 GB), slower</option><option value="any">any (scheduler chooses)</option></select></div>
       <div class="f"><label for="b-q">Queue</label>
         <select id="b-q"><option value="UI-GPU">UI-GPU, recommended</option><option value="all.q">all.q (can be interrupted)</option><option value="CCOM-GPU">CCOM-GPU (group queue, L40S)</option></select></div>
+      <div class="f"><label for="b-g">GPUs on one node</label>
+        <select id="b-g"><option selected>1</option><option>2</option><option>3</option><option>4</option></select><small>One campaign can use several GPUs of the same type on one node, which multiplies designs per hour. Tested with 4 L40S. A100 and V100 usually allow only 1.</small></div>
       <div class="f"><label for="b-w">Workers per GPU</label>
         <select id="b-w"><option>1</option><option selected>2</option><option>3</option><option>4</option><option>5</option></select><small>Workers share one GPU. More workers means more designs per hour, until memory runs out.</small></div>
     </div>
@@ -438,7 +440,7 @@ bc2 list                <span class="c"># all campaigns</span></span></div>
         <li>Status while waiting and running, results, cancel, the duplicate-run check, the dry run, and <code>bc2 test</code> on a real install.</li>
         <li><b>Pausing and resuming:</b> cancelling a campaign part-way, then running it again, carried on with the next attempt, kept the earlier results, and finished with an accepted design.</li>
         <li><code>bc2 edit</code> (including catching a deliberate typo) and <code>bc2 resources</code>.</li>
-        <li><b>BindCraft2 1.0.4</b> on L40S GPUs: 1, 2 and 3 workers sharing one GPU, and a single job on <b>4 GPUs with 2 workers each</b> (8 workers).</li>
+        <li><b>BindCraft2 1.0.4</b> on L40S GPUs: 1, 2 and 3 workers sharing one GPU, and a single job on <b>4 GPUs with 2 workers each</b> (8 workers), including one submitted through <code>bc2 new</code> with the new GPU-count question.</li>
         <li>Nanobody (VHH) campaigns with 1 and 2 workers, and short runs of scFv, Fab and ARP binders. Each ran through the whole design pipeline; none was long enough to judge design quality.</li>
         <li>Earlier BindCraft2 1.0.3 on A40, A100 and V100 GPUs.</li>
       </ul></div>
@@ -446,7 +448,7 @@ bc2 list                <span class="c"># all campaigns</span></span></div>
       <ul>
                 <li>Targets given as mmCIF or FASTA files, and targets with several chains.</li>
         <li>A40, A100 and V100 GPUs with BindCraft2 1.0.4 (they worked with 1.0.3).</li>
-        <li>A GPU-count option in <code>bc2</code> itself: it requests one GPU per job. The 4-GPU test was submitted by hand.</li>
+        <li>More than one GPU on A40 (accepted by the scheduler but not run), and on A100 or V100 (the scheduler refuses; they usually allow 1).</li>
         <li>Long, real campaigns with many designs, and a first-time user on a different account.</li>
       </ul></div>
   </div>
@@ -520,7 +522,7 @@ var STEPS=[
    ["","What kind of binder?  (pick one, or several separated by commas)"],["dim","   1) binder     new miniprotein binder, folded from nothing (the standard choice)"],["dim","   2) VHH        single-domain antibody (nanobody) ..."],["dim","   ... "],["","Choose [1]: <span class=a>1</span>"],
    ["","Shortest binder (Enter = preset): <span class=a>(Enter)</span>"],["","Extra design properties (Enter for none): <span class=a>(Enter)</span>"],["",""],
    ["","How many accepted designs do you want? [10]: <span class=a>10</span>"],["","Give up after how many attempts? [500]: <span class=a>(Enter)</span>"],["",""],
-   ["","Where to run it"],["dim","  Size estimate: target 115 + binder up to 180 residues = about 320 residues folded."],["dim","  Workers that fit on one card:  L40S: 2   A40: 2   A100: 5   V100: 1"],["","GPU type, Choose [1]: <span class=a>1</span>   (L40S)"],["","Queue, Choose [1]: <span class=a>1</span>   (UI-GPU)"],["","Workers per GPU [2]: <span class=a>(Enter)</span>"],["",""],
+   ["","Where to run it"],["dim","  Size estimate: target 115 + binder up to 180 residues = about 320 residues folded."],["dim","  Workers that fit on one card:  L40S: 2   A40: 2   A100: 5   V100: 1"],["","GPU type, Choose [1]: <span class=a>1</span>   (L40S)"],["","Queue, Choose [1]: <span class=a>1</span>   (UI-GPU)"],["","GPUs for this campaign [1]: <span class=a>1</span>"],["","Workers per GPU [2]: <span class=a>(Enter)</span>"],["",""],
    ["ok","Campaign 'my-first-run' is ready"],["dim","  folder   : /Users/hawkid/bc2/campaigns/my-first-run"],["dim","  runs on  : L40S GPU in queue UI-GPU, 8 slots"],["","Submit it to the queue now? [Y/n]: <span class=a>y</span>"],["ok","✓ submitted 'my-first-run' as job 1234503  (L40S, queue UI-GPU)"]],
   tip:"Your queue list may differ: it shows the queues your account can use."},
  {g:"Each project",t:"Check the queue",where:"argon",prompt:ARG,cmd:"bc2 status",
@@ -669,9 +671,9 @@ function build(){
   if(!own&&tk.value==="s5") warns.push("hPD1 is meant as an off-target to avoid, not a usual design target.");
   d.number_of_final_designs=Math.max(1,+$("#b-n").value||1);
   var mt=+$("#b-max").value; if(mt>0) d.max_trajectories=mt;
-  var w=+$("#b-w").value; d.workers_per_gpu=w; d.project_folder="results";
+  var w=+$("#b-w").value, g=+$("#b-g").value, total=g*w; d.workers_per_gpu=w; d.project_folder="results";
   $("#b-jsontext").textContent=JSON.stringify(d,null,2);
-  var gpu=$("#b-gpu").value, q=$("#b-q").value, slots=w>=5?16:(w>=3?12:8), h="";
+  var gpu=$("#b-gpu").value, q=$("#b-q").value, slots=total>=13?24:(total>=9?20:(total>=5?16:(total>=3?12:8))), h="";
   if(q==="CCOM-GPU"&&gpu!=="L40S") warns.push("CCOM-GPU only has L40S cards; bc2 will use L40S.");
   if(tres>0&&mb>0){
     var r=fitTable(tres,mb);
@@ -679,7 +681,8 @@ function build(){
     var c=CARDS.filter(function(c){return c[0].indexOf(gpu)===0})[0];
     if(c){var f=Math.max(0,Math.floor((c[1]-4)/r.e)); if(w>f) warns.push("You asked for "+w+" workers but about "+f+" fit on a "+c[0]+". BindCraft2 starts fewer on its own, so the extra ones are not used.")}
   }else h+='<div>No size estimate for this binder type (the scaffold sets the size). Start with 1 worker and watch memory with <code>bc2 status</code>.</div>';
-  h+='<p style="margin:10px 0 2px"><b>Runs on:</b> '+(gpu==="any"?"any suitable GPU":gpu+" GPU")+' in queue <code>'+q+'</code>, '+slots+' CPU slots (about '+slots*4+' GB RAM).</p>';
+  h+='<p style="margin:10px 0 2px"><b>Runs on:</b> '+(gpu==="any"?"any suitable GPU":(g>1?g+" x ":"")+gpu+" GPU"+(g>1?"s":""))+' in queue <code>'+q+'</code>, '+slots+' CPU slots (about '+slots*4+' GB RAM), '+total+' worker'+(total===1?"":"s")+' in total.</p>';
+  if(g>1&&(gpu==="A100"||gpu==="V100")) warns.push("Several "+gpu+" GPUs on one node are usually not available; the scheduler will refuse the request. Try 1 GPU or an L40S/A40.");
   warns.forEach(function(x){h+='<div class="warnline">⚠ '+esc(x)+'</div>'});
   $("#b-est").innerHTML=h;
 }

@@ -46,14 +46,14 @@ biotite 2.0 breaks the VHH modality and BindCraft2 does not pin it.
 ## What has been tested
 
 On Argon with driver 535, BindCraft2 1.0.4 on L40S GPUs: 1, 2 and 3 workers sharing one GPU, one job on 4 GPUs
-with 2 workers each (8 workers), nanobody (VHH) campaigns with 1 and 2 workers, and short runs of scFv, Fab and
+with 2 workers each (8 workers, requested through `bc2 new`), nanobody (VHH) campaigns with 1 and 2 workers, and short runs of scFv, Fab and
 ARP binders. BindCraft2 1.0.3 was also run on A40, A100 and V100 GPUs. The `bc2` flow (setup as a batch job, the
 question wizard, `bc2 test`, real submitted campaigns that produced accepted designs, status, results, cancel,
 resume after a stop, edit, resources) was verified on a real install.
 
 Not yet tested: A40, A100 and V100 with 1.0.4, mmCIF, FASTA and multi-chain targets through the wizard, long
-campaigns, and any antibody run long enough to judge design quality. `bc2` requests one GPU per job; multi-GPU jobs
-have to be submitted by hand for now.
+campaigns, and any antibody run long enough to judge design quality. `bc2` can request up to 4 GPUs of one type
+on a node; A100 and V100 nodes usually allow only 1, and the scheduler refuses requests it cannot meet.
 
 ## License note
 

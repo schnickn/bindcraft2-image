@@ -57,7 +57,7 @@ bc2 results NAME        # the best designs
 3. **The binder type** (new miniprotein, nanobody, scFv, peptide, ...) and, for most types, the length range.
 4. **Optional properties** such as humanization.
 5. **How many accepted designs** you want and how many attempts to allow before giving up.
-6. **Where to run it:** GPU type, queue and workers per GPU, with a memory estimate for your target size.
+6. **Where to run it:** GPU type, queue, how many GPUs (1 to 4 on one node) and workers per GPU, with a memory estimate for your target size.
 
 It writes everything into `~/bc2/campaigns/NAME/`, shows you the settings file it created, and offers to
 submit. If you are not sure, accept the defaults.
@@ -73,14 +73,15 @@ submit. If you are not sure, accept the defaults.
 | `bc2 results NAME [N]` | Top N designs, plus the `scp` command to copy them to your computer |
 | `bc2 cancel NAME` | Stop a queued or running campaign (progress is kept) |
 | `bc2 edit NAME` | Open `settings.json` in nano (`export EDITOR=vim` to change) and check it is valid |
-| `bc2 resources NAME` | Change GPU type, queue and workers |
+| `bc2 resources NAME` | Change GPU type, queue, number of GPUs and workers |
 | `bc2 list` | All campaigns |
 
 ## Things worth knowing
 
 - **Each campaign is its own folder.** Never point two campaigns at the same results folder.
 - **Accepted designs are rare.** Most attempts fail the quality filters, so the attempts cap matters. A hard target can use many GPU hours.
-- **GPU choice.** L40S, A40, A100 and V100 have all been tested. The V100 is about 60% slower. On UI-GPU you can have one job running at a time.
+- **GPU choice.** L40S, A40, A100 and V100 have all been tested (on BindCraft2 1.0.3; 1.0.4 on L40S). The V100 is about 60% slower. On UI-GPU you can have one job running at a time.
+- **Several GPUs.** One campaign can use up to 4 GPUs of the same type on one node, so it finishes more designs per hour (a 4-GPU L40S job with 2 workers per card ran 8 workers at once). The scheduler decides whether a node can supply them: A100 and V100 requests usually allow only 1, and `bc2 run` tells you if the request is refused. More workers also need more memory, which `bc2` requests for you.
 - **all.q** starts quickly but can be interrupted at any moment. Run `bc2 run NAME` again and the campaign continues.
 - **The first run is slower and uses more memory.** BindCraft2 compiles its GPU code the first time it sees a given GPU type and size, and keeps the result in `~/bc2/xla_cache`. A first single-worker run peaked at about 29 GB of host memory, so keep the default of 8 slots. Later runs on the same GPU type are faster and lighter.
 - **Memory.** Bigger targets need more GPU memory per worker; the wizard shows an estimate and how many workers fit on each card. The default of 8 CPU slots (about 32 GB of RAM) covers up to 2 workers; 3 workers uses 12 slots.
