@@ -117,6 +117,7 @@ jobs:
         run: |
           img='${{ steps.cfg.outputs.image }}:${{ steps.cfg.outputs.accel }}-${{ steps.up.outputs.short }}'
           docker run --rm "$img" --help | head -5
+          docker run --rm --entrypoint python3 "$img" -c "import biotite; print('biotite', biotite.__version__); assert biotite.__version__.startswith('1.'), 'biotite 2 breaks VHH, see the Dockerfile'"
           docker run --rm "$img" design --list-properties | tr '\n' ' '; echo
           docker run --rm --entrypoint python3 "$img" -c "import jax; print('jax', jax.__version__)"
           docker run --rm --entrypoint python3 "$img" -m bindcraft.selfcheck '${{ steps.cfg.outputs.accel }}' --shipped-only && echo selfcheck ok
