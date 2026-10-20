@@ -438,12 +438,15 @@ bc2 list                <span class="c"># all campaigns</span></span></div>
         <li>Status while waiting and running, results, cancel, the duplicate-run check, the dry run, and <code>bc2 test</code> on a real install.</li>
         <li><b>Pausing and resuming:</b> cancelling a campaign part-way, then running it again, carried on with the next attempt, kept the earlier results, and finished with an accepted design.</li>
         <li><code>bc2 edit</code> (including catching a deliberate typo) and <code>bc2 resources</code>.</li>
-        <li>BindCraft2 itself on L40S, A40, A100 and V100 GPUs, and with 1, 2 and 3 workers on one GPU.</li>
+        <li><b>BindCraft2 1.0.4</b> on L40S GPUs: 1, 2 and 3 workers sharing one GPU, and a single job on <b>4 GPUs with 2 workers each</b> (8 workers).</li>
+        <li>Nanobody (VHH) campaigns with 1 and 2 workers, and short runs of scFv, Fab and ARP binders. Each ran through the whole design pipeline; none was long enough to judge design quality.</li>
+        <li>Earlier BindCraft2 1.0.3 on A40, A100 and V100 GPUs.</li>
       </ul></div>
     <div class="card"><b>Not tested yet</b>
       <ul>
                 <li>Targets given as mmCIF or FASTA files, and targets with several chains.</li>
-        <li>Antibody-type binders (VHH, scFv, Fab) and other scaffold types.</li>
+        <li>A40, A100 and V100 GPUs with BindCraft2 1.0.4 (they worked with 1.0.3).</li>
+        <li>A GPU-count option in <code>bc2</code> itself: it requests one GPU per job. The 4-GPU test was submitted by hand.</li>
         <li>Long, real campaigns with many designs, and a first-time user on a different account.</li>
       </ul></div>
   </div>
