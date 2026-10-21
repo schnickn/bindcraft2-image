@@ -6,13 +6,13 @@ Everything a University of Iowa Argon user needs to run [BindCraft2](https://git
 - **`bc2`**: a terminal helper that installs BindCraft2, asks you plain questions to set up a design
   campaign, submits it to the queue, and shows progress and results.
 - **A container image** with BindCraft2 built for Argon's GPU drivers.
-- **A beginner's guide** (a web page, [open it here](https://schnickn.github.io/bindcraft2-image/)) for people who know neither BindCraft nor Argon.
+- **A beginner's guide** (a web page, [open it here](https://schnickn.github.io/bindcraft2-for-argon/)) for people who know neither BindCraft nor Argon.
 
 ## Quick start (on an Argon login node)
 
 ```bash
 mkdir -p ~/bin && cd ~/bin
-curl -fsSLO https://raw.githubusercontent.com/schnickn/bindcraft2-image/main/bc2
+curl -fsSLO https://raw.githubusercontent.com/schnickn/bindcraft2-for-argon/main/bc2
 chmod +x bc2
 echo 'setenv PATH $HOME/bin:$PATH' >> ~/.tcshrc     # bash users: ~/.bashrc and  export PATH=$HOME/bin:$PATH
 ```
@@ -27,7 +27,7 @@ bc2 results NAME
 ```
 
 **New to BindCraft or Argon? Start with the interactive guide:
-<https://schnickn.github.io/bindcraft2-image/>**  It explains each step in plain language, lets you
+<https://schnickn.github.io/bindcraft2-for-argon/>**  It explains each step in plain language, lets you
 practice the commands in a simulated terminal, and helps you plan memory for your target. The command
 reference is in [docs/bc2.md](docs/bc2.md).
 

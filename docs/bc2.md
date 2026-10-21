@@ -1,6 +1,6 @@
 # bc2: run BindCraft2 on Argon
 
-New to this? The [interactive beginner's guide](https://schnickn.github.io/bindcraft2-image/) walks through every step.
+New to this? The [interactive beginner's guide](https://schnickn.github.io/bindcraft2-for-argon/) walks through every step.
 
 `bc2` is one terminal script that sets up BindCraft2 on Argon, asks you a few questions instead of making
 you edit JSON and job scripts, submits the job, and shows you the results. It is built for people running
@@ -14,7 +14,7 @@ On an Argon login node:
 
 ```bash
 mkdir -p ~/bin && cd ~/bin
-curl -fsSLO https://raw.githubusercontent.com/schnickn/bindcraft2-image/main/bc2
+curl -fsSLO https://raw.githubusercontent.com/schnickn/bindcraft2-for-argon/main/bc2
 chmod +x bc2
 echo 'setenv PATH $HOME/bin:$PATH' >> ~/.tcshrc      # most Argon accounts use tcsh; for bash use ~/.bashrc and: export PATH=$HOME/bin:$PATH
 ```

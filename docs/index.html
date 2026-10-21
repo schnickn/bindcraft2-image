@@ -195,7 +195,7 @@ footer{background:var(--black);color:#b9b9c0;border-top:6px solid var(--gold);pa
     <div class="actions">
       <a class="btn gold" href="#overview">Start here</a>
       <a class="btn" href="#walkthrough">Jump to the walkthrough</a>
-      <a class="btn" href="https://github.com/schnickn/bindcraft2-image">Get bc2 on GitHub</a>
+      <a class="btn" href="https://github.com/schnickn/bindcraft2-for-argon">Get bc2 on GitHub</a>
     </div>
   </div>
 </header>
@@ -457,7 +457,7 @@ bc2 list                <span class="c"># all campaigns</span></span></div>
 
   </main>
 </div>
-<footer><div class="wrap">Beginner's guide to <code>bc2</code> for BindCraft2 on Argon. Interactive pages here are simulations and never connect to the cluster. Source and the <code>bc2</code> script: <a href="https://github.com/schnickn/bindcraft2-image" style="color:var(--gold)">github.com/schnickn/bindcraft2-image</a>.</div></footer>
+<footer><div class="wrap">Beginner's guide to <code>bc2</code> for BindCraft2 on Argon. Interactive pages here are simulations and never connect to the cluster. Source and the <code>bc2</code> script: <a href="https://github.com/schnickn/bindcraft2-for-argon" style="color:var(--gold)">github.com/schnickn/bindcraft2-for-argon</a>.</div></footer>
 
 <script>
 (function(){
@@ -491,7 +491,7 @@ var STEPS=[
   why:"Argon is reached over the network with <code>ssh</code>. Replace <code>hawkid</code> with your own HawkID. Off campus you may need the university VPN first. You will be asked for your password and a Duo approval; you type those yourself.",
   out:[["dim","(hawkid@argon.hpc.uiowa.edu) Password: "],["dim","  (you type it; nothing shows as you type)"],["dim","Duo two-factor: approve the request on your phone"],["ok","Last login: Fri Oct 16 09:12:44 2026 from campus"],["p",ARG+" "]],
   tip:"From here on, commands run on Argon unless a step says laptop."},
-{g:"Install once",t:"Download bc2",where:"argon",prompt:ARG,cmd:"mkdir -p ~/bin && cd ~/bin && curl -fsSLO https://raw.githubusercontent.com/schnickn/bindcraft2-image/main/bc2 && chmod +x bc2",
+{g:"Install once",t:"Download bc2",where:"argon",prompt:ARG,cmd:"mkdir -p ~/bin && cd ~/bin && curl -fsSLO https://raw.githubusercontent.com/schnickn/bindcraft2-for-argon/main/bc2 && chmod +x bc2",
   why:"This makes a personal <code>bin</code> folder, downloads the <code>bc2</code> helper script from its public home on GitHub into it, and marks it as a program. Keep it in <code>~/bin</code>: bc2 stores its own data in a folder called <code>~/bc2</code>, so the script must not sit there. If your lab gave you the file directly, copy it up from your own computer with <code>scp bc2 hawkid@argon.hpc.uiowa.edu:~/bin/</code> (run that one on your computer).",
   out:[["dim","(no output means it worked; check with: ls -l ~/bin/bc2)"],["p",ARG+" "]],
   tip:"Argon login nodes can reach github.com, so this works without any other setup."},
